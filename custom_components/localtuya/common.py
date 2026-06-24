@@ -147,6 +147,7 @@ class TuyaDevice(pytuya.TuyaListener, pytuya.ContextualLogger):
         self._connect_task = None
         self._disconnect_task = None
         self._unsub_interval = None
+        self._update_lock = asyncio.Lock()
         self._entities = []
         self._local_key = self._dev_config_entry[CONF_LOCAL_KEY]
         self._default_reset_dpids = None
@@ -176,6 +177,11 @@ class TuyaDevice(pytuya.TuyaListener, pytuya.ContextualLogger):
     def connected(self):
         """Return if connected to device."""
         return self._interface is not None
+
+    @property
+    def device_config(self):
+        """Return the device's current configuration."""
+        return self._dev_config_entry
 
     def async_connect(self):
         """Connect to device if not already connected."""
@@ -304,17 +310,109 @@ class TuyaDevice(pytuya.TuyaListener, pytuya.ContextualLogger):
     async def close(self):
         """Close connection and stop re-connect loop."""
         self._is_closing = True
+        # Stop the scan-interval poller. disconnected() also clears this, but a
+        # repoint detaches the listener so disconnected() never fires -- without
+        # this, every repoint would leak the previous async_track_time_interval
+        # callback (a duplicate _async_refresh timer).
+        if self._unsub_interval is not None:
+            self._unsub_interval()
+            self._unsub_interval = None
         if self._connect_task is not None:
             self._connect_task.cancel()
-            await self._connect_task
+            # Awaiting a task we just cancelled re-raises CancelledError. Swallow
+            # that: otherwise it propagates out of close() and out of the caller
+            # (e.g. async_update_config) before the connection state is reset,
+            # leaving the device stuck with _is_closing=True so async_connect()
+            # refuses forever -- a non-recoverable wedge. But if our OWN task is
+            # being cancelled (e.g. HA cancelling unload), propagate that instead
+            # of suppressing it.
+            try:
+                await self._connect_task
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling() > 0:
+                    raise
         if self._interface is not None:
             await self._interface.close()
         if self._disconnect_task is not None:
             self._disconnect_task()
+            # Null it so a later disconnected() (which also releases it, e.g. on
+            # unload where the listener is not detached and connection_lost still
+            # fires) does not double-release the dispatcher subscription -- the
+            # HA dispatcher unsub raises on a second call.
+            self._disconnect_task = None
         self.info(
             "Closed connection with device %s.",
             self._dev_config_entry[CONF_FRIENDLY_NAME],
         )
+
+    async def async_update_config(self, dev_config):
+        """Apply an updated device configuration in place.
+
+        Used when only a single device's connection details change (e.g. a new
+        IP discovered after a DHCP lease change, or a refreshed local key) so
+        that the device can be repointed and reconnected without reloading the
+        whole config entry and tearing down every other device.
+        """
+        # Serialize updates for this device. Several devices changing IP at once
+        # (e.g. after a power outage) makes every device's update_listener
+        # repoint every changed device, so the same device can get overlapping
+        # async_update_config calls; without serialization they race close()/
+        # async_connect() and can wedge the device.
+        async with self._update_lock:
+            old_config = self._dev_config_entry
+            if dev_config == old_config:
+                # A concurrent update already applied this config; nothing to do
+                # beyond making sure we are (re)connecting.
+                self.async_connect()
+                return
+
+            self._dev_config_entry = dev_config.copy()
+            self._local_key = self._dev_config_entry[CONF_LOCAL_KEY]
+
+            needs_reconnect = (
+                old_config.get(CONF_HOST) != self._dev_config_entry.get(CONF_HOST)
+                or old_config.get(CONF_LOCAL_KEY)
+                != self._dev_config_entry.get(CONF_LOCAL_KEY)
+            )
+
+            if not needs_reconnect:
+                self.async_connect()
+                return
+
+            self.info(
+                "Connection settings changed, reconnecting to %s",
+                self._dev_config_entry.get(CONF_HOST),
+            )
+            # Detach our listener from the old interface BEFORE closing it.
+            # close() -> transport.close() delivers connection_lost (->
+            # disconnected()) on a later loop iteration -- and an arbitrary
+            # number of iterations later if the socket has pending writes (the
+            # heartbeat writes just before close). If that stale callback fired
+            # after we reconnect, it would null the fresh interface and cancel
+            # the fresh connect task, stranding the device until the 60s
+            # reconnect tick. pytuya's connection_lost is a no-op when the
+            # listener weakref yields None, so detaching neutralises it
+            # regardless of delivery timing.
+            if self._interface is not None:
+                self._interface.listener = None
+            try:
+                await self.close()
+            except Exception:  # pylint: disable=broad-except
+                # A teardown failure must never leave the device wedged: the
+                # finally below always resets the connection state. (Outer-task
+                # cancellation is a BaseException, so it is not caught here and
+                # still propagates after the reset runs.)
+                self.exception("Error closing old connection while repointing")
+            finally:
+                # close() relies on the (now neutralised) disconnected() callback
+                # to null the interface, so clear it ourselves -- unconditionally,
+                # so _is_closing can never stick True (async_connect would then
+                # refuse forever).
+                self._interface = None
+                self._connect_task = None
+                self._is_closing = False
+            self.async_connect()
 
     async def set_dp(self, state, dp_index):
         """Change value of a DP of the Tuya device."""
@@ -358,6 +456,12 @@ class TuyaDevice(pytuya.TuyaListener, pytuya.ContextualLogger):
         if self._unsub_interval is not None:
             self._unsub_interval()
             self._unsub_interval = None
+        # Release the per-connection dispatcher subscription too; otherwise a
+        # plain disconnect -> reconnect overwrites _disconnect_task in
+        # _make_connection and orphans the old async_dispatcher_connect unsub.
+        if self._disconnect_task is not None:
+            self._disconnect_task()
+            self._disconnect_task = None
         self._interface = None
 
         if self._connect_task is not None:

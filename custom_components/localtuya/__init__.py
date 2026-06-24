@@ -77,9 +77,15 @@ async def async_setup(hass: HomeAssistant, config: dict):
 
         current_entries = hass.config_entries.async_entries(DOMAIN)
 
+        # Only reload entries in a recoverable state. Reloading an entry whose
+        # unload/setup is already in progress raises and can leave it wedged in
+        # a non-recoverable state (requiring a HA restart). "recoverable" still
+        # covers LOADED as well as failed-setup states (SETUP_ERROR/RETRY,
+        # NOT_LOADED), which is exactly when a user reloads to recover.
         reload_tasks = [
             hass.config_entries.async_reload(entry.entry_id)
             for entry in current_entries
+            if entry.state.recoverable
         ]
 
         await asyncio.gather(*reload_tasks)
@@ -131,17 +137,19 @@ async def async_setup(hass: HomeAssistant, config: dict):
             updated = True
             new_data[CONF_DEVICES][device_id][CONF_PRODUCT_KEY] = product_key
 
-        # Update settings if something changed, otherwise try to connect. Updating
-        # settings triggers a reload of the config entry, which tears down the device
-        # so no need to connect in that case.
+        # If settings changed, persist them. update_listener applies the change
+        # to the affected device in place (repoint + reconnect) without reloading
+        # the whole entry, so we return here rather than also connecting to the
+        # old IP below (which would race the in-place reconnect).
         if updated:
             _LOGGER.debug(
                 "Updating keys for device %s: %s %s", device_id, device_ip, product_key
             )
             new_data[ATTR_UPDATED_AT] = str(int(time.time() * 1000))
             hass.config_entries.async_update_entry(entry, data=new_data)
+            return
 
-        elif device_id in hass.data[DOMAIN][TUYA_DEVICES]:
+        if device_id in hass.data[DOMAIN][TUYA_DEVICES]:
             _LOGGER.debug("Device %s found with IP %s", device_id, device_ip)
 
         device = hass.data[DOMAIN][TUYA_DEVICES].get(device_id)
@@ -318,8 +326,38 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
 
 
 async def update_listener(hass, config_entry):
-    """Update listener."""
-    await hass.config_entries.async_reload(config_entry.entry_id)
+    """Apply an updated config entry.
+
+    A change to a single device's connection details (e.g. a new IP learned via
+    discovery, or a refreshed local key) is applied to the running device in
+    place. Only structural changes -- a device added or removed, or a device's
+    entity configuration changed -- require a full reload of the entry. This
+    keeps a single device's IP change from tearing down every other device.
+    """
+    devices = hass.data[DOMAIN][TUYA_DEVICES]
+    entry_devices = config_entry.data[CONF_DEVICES]
+
+    structural_change = set(entry_devices) != set(devices)
+    if not structural_change:
+        for dev_id, dev_config in entry_devices.items():
+            if (
+                dev_config[CONF_ENTITIES]
+                != devices[dev_id].device_config[CONF_ENTITIES]
+            ):
+                structural_change = True
+                break
+
+    if structural_change:
+        await hass.config_entries.async_reload(config_entry.entry_id)
+        return
+
+    for dev_id, dev_config in entry_devices.items():
+        try:
+            await devices[dev_id].async_update_config(dev_config)
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.exception(
+                "Failed to apply updated configuration to device %s", dev_id
+            )
 
 
 async def async_remove_config_entry_device(
